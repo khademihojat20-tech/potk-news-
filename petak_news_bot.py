@@ -16,7 +16,7 @@ import schedule
 # تنظیمات
 # -----------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
+TELEGRAM_CHANNEL_ID = "@potknew"  # کانال مقصد
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -30,6 +30,8 @@ MAX_ITEMS_PER_RUN = 3
 RUN_TIMES = ["08:00", "12:00", "16:00", "20:00"]
 BREAKING_CHECK_MINUTES = 20
 
+SOURCE_CHANNEL_USERNAMES = ["RoidBest", "khabari_18"]  # بدون @
+
 RSS_FEEDS = [
     "https://www.donya-e-eqtesad.com/rss",
     "https://www.eghtesadnews.com/rss",
@@ -42,9 +44,9 @@ RSS_FEEDS = [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [پتک‌نیوز] %(message)s")
 log = logging.getLogger("petak-news")
 
-# -----------------------------
-# فایل‌های حافظه
-# -----------------------------
+seen = set()
+queue_file = Path("queue.json")
+
 def load_json(path, default):
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
@@ -55,10 +57,14 @@ def save_json(path, data):
 
 seen = set(load_json(SEEN_FILE, []))
 cache = load_json(CACHE_FILE, {})
+queue = load_json(queue_file, [])
 
 # -----------------------------
 # ابزارهای کمکی
 # -----------------------------
+def article_id_from_text(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 def article_id(entry):
     base = entry.get("id") or entry.get("link") or entry.get("title", "")
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
@@ -94,7 +100,119 @@ def call_groq(prompt):
     return data["choices"][0]["message"]["content"].strip()
 
 # -----------------------------
-# جمع‌آوری خبرهای جدید
+# بازنویسی خبر (RSS یا کانال)
+# -----------------------------
+def rewrite_text(raw_text, source_label=""):
+    aid = article_id_from_text(raw_text)
+    if aid in cache:
+        return cache[aid]
+
+    prompt = f"""
+تو خبرنگار حرفه‌ای کانال خبری «پتک نیوز» هستی.
+متن زیر را کامل بخوان و یک خبر تازه، منسجم و قابل‌فهم برای مخاطب فارسی‌زبان بنویس.
+
+قوانین:
+- در خط اول، یک عنوان خبری کوتاه و جذاب با ایموجی مرتبط بنویس.
+- در بدنه، ۳ تا ۶ جمله بنویس که:
+  - ماجرا را از ابتدا تا انتها توضیح دهد،
+  - نکات مهم، اعداد، نام‌ها و زمان‌ها را حفظ کند،
+  - هیچ تحلیل شخصی یا نظر اضافه نداشته باشد.
+- اگر متن اصلی پراکنده است، آن را منظم و قابل‌فهم کن.
+- هیچ نام کانال، لینک، یوزرنیم یا تبلیغی از متن اصلی را تکرار نکن.
+- در پایان، یک خط منبع کوتاه ثابت بنویس: «🔗 منبع: پتک نیوز»
+- در انتها ۲ تا ۳ هشتگ فارسی مرتبط اضافه کن.
+- فقط متن نهایی پست خبری را بده.
+
+متن خبر:
+{raw_text}
+"""
+
+    try:
+        result = call_groq(prompt)
+    except RuntimeError as e:
+        log.error(f"خطا در بازنویسی با Groq: {e}")
+        raise
+
+    cache[aid] = result
+    save_json(CACHE_FILE, cache)
+    return result
+
+def rewrite_article(article):
+    text = f"عنوان: {article['title']}\n\nخلاصه:\n{article['summary']}"
+    return rewrite_text(text, source_label=article["source"])
+
+# -----------------------------
+# تشخیص خبر فوری
+# -----------------------------
+def is_breaking_text(text):
+    # ساده: اگر کلمات کلیدی باشد، فوری
+    keywords = ["فوری", "خبر فوری", "urgent", "breaking"]
+    t = text.lower()
+    return any(k in t for k in keywords)
+
+# -----------------------------
+# ارسال به تلگرام
+# -----------------------------
+def post(text, breaking=False):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    prefix = "🚨 <b>خبر فوری</b>\n\n" if breaking else ""
+    payload = {
+        "chat_id": TELEGRAM_CHANNEL_ID,
+        "text": f"{prefix}{text}\n\n📡 {CHANNEL_NAME}",
+        "parse_mode": "HTML",
+    }
+    r = requests.post(url, json=payload, timeout=20)
+    if r.status_code != 200:
+        log.error(f"ارسال به تلگرام ناموفق بود: {r.status_code} {r.text}")
+        return False
+    return True
+
+# -----------------------------
+# خواندن کانال‌های تلگرام (منبع)
+# -----------------------------
+LAST_UPDATE_ID_FILE = Path("last_update_id.json")
+last_update_id = load_json(LAST_UPDATE_ID_FILE, 0)
+
+def fetch_from_source_channels():
+    global last_update_id
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {
+        "offset": last_update_id + 1,
+        "timeout": 10,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=20)
+    except Exception as e:
+        log.error(f"خطا در getUpdates: {e}")
+        return []
+
+    if r.status_code != 200:
+        log.error(f"getUpdates ناموفق بود: {r.status_code} {r.text}")
+        return []
+
+    data = r.json()
+    updates = data.get("result", [])
+    messages = []
+
+    for upd in updates:
+        last_update_id = upd["update_id"]
+        msg = upd.get("message") or upd.get("channel_post")
+        if not msg:
+            continue
+
+        chat = msg.get("chat", {})
+        username = chat.get("username", "")
+        if username in SOURCE_CHANNEL_USERNAMES:
+            text = msg.get("text") or ""
+            if not text.strip():
+                continue
+            messages.append(text)
+
+    save_json(LAST_UPDATE_ID_FILE, last_update_id)
+    return messages
+
+# -----------------------------
+# جمع‌آوری خبرهای جدید از RSS
 # -----------------------------
 def fetch_new_articles():
     fresh = []
@@ -113,93 +231,32 @@ def fetch_new_articles():
                 "id": aid,
                 "title": entry.get("title", "").strip(),
                 "summary": entry.get("summary", "")[:1500],
-                "link": entry.get("link", ""),
-                "source": parsed.feed.get("title", url),
             })
     return fresh
 
 # -----------------------------
-# بازنویسی کامل — با کش
+# صف خبرهای معمولی
 # -----------------------------
-def rewrite(article):
-    if article["id"] in cache:
-        return cache[article["id"]]
+def add_to_queue(text):
+    queue.append(text)
+    save_json(queue_file, queue)
 
-    prompt = f"""
-تو خبرنگار حرفه‌ای کانال خبری «پتک نیوز» هستی.
-متن زیر را کامل بخوان و یک خبر تازه، منسجم و قابل‌فهم برای مخاطب فارسی‌زبان بنویس.
-
-قوانین:
-- در خط اول، یک عنوان خبری کوتاه و جذاب با ایموجی مرتبط بنویس.
-- در بدنه، ۳ تا ۶ جمله بنویس که:
-  - ماجرا را از ابتدا تا انتها توضیح دهد،
-  - نکات مهم، اعداد، نام‌ها و زمان‌ها را حفظ کند،
-  - هیچ تحلیل شخصی یا نظر اضافه نداشته باشد.
-- اگر متن اصلی پراکنده است، آن را منظم و قابل‌فهم کن.
-- در پایان، یک خط منبع بنویس: «منبع: {article['source']}»
-- در انتها ۲ تا ۳ هشتگ فارسی مرتبط اضافه کن.
-- فقط متن نهایی پست خبری را بده.
-
-عنوان اصلی خبر:
-{article['title']}
-
-متن/خلاصه خبر:
-{article['summary']}
-"""
-
-    try:
-        result = call_groq(prompt)
-    except RuntimeError as e:
-        log.error(f"خطا در بازنویسی با Groq: {e}")
-        raise
-
-    cache[article["id"]] = result
-    save_json(CACHE_FILE, cache)
-    return result
+def process_queue_once():
+    if not queue:
+        return
+    text = queue.pop(0)
+    save_json(queue_file, queue)
+    post(text, breaking=False)
 
 # -----------------------------
-# تشخیص خبر فوری
+# چرخه‌ی اصلی RSS
 # -----------------------------
-def is_breaking(article):
-    prompt = f"""
-عنوان خبر: {article['title']}
-
-آیا این خبر مهم و فوری است؟ فقط بله یا خیر.
-"""
-    try:
-        answer = call_groq(prompt)
-    except RuntimeError as e:
-        log.error(f"خطا در تشخیص خبر فوری با Groq: {e}")
-        return False
-
-    return answer.strip().startswith("بله")
-
-# -----------------------------
-# ارسال به تلگرام
-# -----------------------------
-def post(text, link, breaking=False):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    prefix = "🚨 <b>خبر فوری</b>\n\n" if breaking else ""
-    payload = {
-        "chat_id": TELEGRAM_CHANNEL_ID,
-        "text": f"{prefix}{text}\n\n🔗 {link}\n\n📡 {CHANNEL_NAME}",
-        "parse_mode": "HTML",
-    }
-    r = requests.post(url, json=payload, timeout=20)
-    if r.status_code != 200:
-        log.error(f"ارسال به تلگرام ناموفق بود: {r.status_code} {r.text}")
-        return False
-    return True
-
-# -----------------------------
-# چرخه‌ی اصلی
-# -----------------------------
-def run_cycle():
-    log.info("شروع بررسی خبرهای جدید...")
+def run_cycle_rss():
+    log.info("شروع بررسی خبرهای جدید RSS...")
     fresh = fetch_new_articles()
 
     if not fresh:
-        log.info("خبر جدیدی نیست.")
+        log.info("خبر جدیدی از RSS نیست.")
         return
 
     published = 0
@@ -208,36 +265,42 @@ def run_cycle():
             break
 
         try:
-            text = rewrite(article)
-            if post(text, article["link"]):
-                seen.add(article["id"])
-                published += 1
-                log.info(f"منتشر شد: {article['title'][:50]}")
-                time.sleep(2)
+            text = rewrite_article(article)
+            if is_breaking_text(article["title"] + " " + article["summary"]):
+                post(text, breaking=True)
+            else:
+                add_to_queue(text)
+            seen.add(article["id"])
+            published += 1
+            log.info(f"خبر RSS پردازش شد: {article['title'][:50]}")
+            time.sleep(2)
         except Exception as e:
-            log.error(f"خطا در پردازش خبر «{article['title'][:40]}»: {e}")
+            log.error(f"خطا در پردازش خبر RSS «{article['title'][:40]}»: {e}")
 
     save_json(SEEN_FILE, list(seen))
-    log.info(f"پایان چرخه — {published} خبر منتشر شد.")
+    log.info(f"پایان چرخه RSS — {published} خبر پردازش شد.")
 
 # -----------------------------
-# خبر فوری
+# چرخه‌ی کانال‌های تلگرام
 # -----------------------------
-def check_breaking():
-    fresh = fetch_new_articles()
-    if not fresh:
+def run_cycle_channels():
+    log.info("بررسی کانال‌های تلگرام منبع...")
+    msgs = fetch_from_source_channels()
+    if not msgs:
+        log.info("پیام جدیدی از کانال‌های منبع نیست.")
         return
 
-    for article in fresh:
+    for raw in msgs:
         try:
-            if is_breaking(article):
-                text = rewrite(article)
-                if post(text, article["link"], breaking=True):
-                    seen.add(article["id"])
-                    save_json(SEEN_FILE, list(seen))
-                    log.info(f"🚨 خبر فوری منتشر شد: {article['title'][:50]}")
+            text = rewrite_text(raw_text=raw, source_label="کانال تلگرام")
+            if is_breaking_text(raw):
+                post(text, breaking=True)
+            else:
+                add_to_queue(text)
+            log.info("پیام کانال منبع پردازش شد.")
+            time.sleep(1)
         except Exception as e:
-            log.error(f"خطا در خبر فوری «{article['title'][:40]}»: {e}")
+            log.error(f"خطا در پردازش پیام کانال منبع: {e}")
 
 # -----------------------------
 # اجرای اصلی
@@ -245,21 +308,27 @@ def check_breaking():
 def main():
     log.info("پتک نیوز — ربات راه‌اندازی شد.")
 
-    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GROQ_API_KEY]):
-        log.error("متغیرهای محیطی TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID / GROQ_API_KEY تنظیم نشده‌اند.")
+    if not TELEGRAM_BOT_TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN تنظیم نشده است.")
+        return
+    if not GROQ_API_KEY:
+        log.error("GROQ_API_KEY تنظیم نشده است.")
         return
 
+    # چرخه‌های زمان‌بندی‌شده
     for t in RUN_TIMES:
-        schedule.every().day.at(t).do(run_cycle)
+        schedule.every().day.at(t).do(run_cycle_rss)
 
-    schedule.every(BREAKING_CHECK_MINUTES).minutes.do(check_breaking)
+    schedule.every(BREAKING_CHECK_MINUTES).minutes.do(run_cycle_channels)
+    schedule.every().hour.do(process_queue_once)
 
-    # اجرای فوری یک چرخه در استارت
-    run_cycle()
+    # اجرای اولیه
+    run_cycle_rss()
+    run_cycle_channels()
 
     while True:
         schedule.run_pending()
-        time.sleep(20)
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
