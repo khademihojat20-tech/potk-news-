@@ -6,6 +6,7 @@ import json
 import time
 import hashlib
 import logging
+import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -26,15 +27,13 @@ GROQ_MODEL = "llama-3.1-8b-instant"
 CHANNEL_NAME = "پتک نیوز"
 SEEN_FILE = Path("seen.json")
 CACHE_FILE = Path("cache.json")
-QUEUE_FILE = Path("queue.json")
 LAST_UPDATE_ID_FILE = Path("last_update_id.json")
 
 MAX_ITEMS_PER_RUN = 5          # تعداد خبر RSS در هر چرخه
 RUN_TIMES = ["08:00", "12:00", "16:00", "20:00"]
 BREAKING_CHECK_MINUTES = 20    # بررسی کانال‌های منبع
-QUEUE_POST_INTERVAL_MIN = 60   # هر چند دقیقه یک خبر از صف
 
-SOURCE_CHANNEL_USERNAMES = ["RoidBest", "khabari_18"]  # بدون @
+SOURCE_CHANNEL_USERNAMES = ["RoidBest", "khabari_18"]  # بدون @ — ربات باید ادمین این کانال‌ها باشد
 
 RSS_FEEDS = [
     "https://www.donya-e-eqtesad.com/rss",
@@ -47,6 +46,11 @@ RSS_FEEDS = [
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [پتک‌نیوز] %(message)s")
 log = logging.getLogger("petak-news")
+
+# قفل‌ها برای جلوگیری از نوشتن هم‌زمان و خراب‌شدن فایل‌های JSON
+# وقتی چند ترد هم‌زمان روی cache.json و seen.json کار می‌کنند لازم است
+_cache_lock = threading.Lock()
+_seen_lock = threading.Lock()
 
 # -----------------------------
 # فایل‌های حافظه
@@ -61,7 +65,6 @@ def save_json(path, data):
 
 seen = set(load_json(SEEN_FILE, []))
 cache = load_json(CACHE_FILE, {})
-queue = load_json(QUEUE_FILE, [])
 last_update_id = load_json(LAST_UPDATE_ID_FILE, 0)
 
 # -----------------------------
@@ -109,10 +112,12 @@ def call_groq(prompt):
 # -----------------------------
 def rewrite_text(raw_text, source_label=""):
     aid = article_id_from_text(raw_text)
-    if aid in cache:
-        return cache[aid]
 
-    prompt = f"""
+    with _cache_lock:
+        if aid in cache:
+            return cache[aid]
+
+    result = call_groq(f"""
 تو خبرنگار حرفه‌ای کانال خبری «پتک نیوز» هستی.
 متن زیر را کامل بخوان و یک خبر تازه، منسجم و قابل‌فهم برای مخاطب فارسی‌زبان بنویس.
 
@@ -130,11 +135,12 @@ def rewrite_text(raw_text, source_label=""):
 
 متن خبر:
 {raw_text}
-"""
+""")
 
-    result = call_groq(prompt)
-    cache[aid] = result
-    save_json(CACHE_FILE, cache)
+    with _cache_lock:
+        cache[aid] = result
+        save_json(CACHE_FILE, cache)
+
     return result
 
 def rewrite_article(article):
@@ -166,21 +172,6 @@ def post(text, breaking=False):
         log.error(f"ارسال به تلگرام ناموفق بود: {r.status_code} {r.text}")
         return False
     return True
-
-# -----------------------------
-# صف خبرهای معمولی
-# -----------------------------
-def add_to_queue(text):
-    queue.append(text)
-    save_json(QUEUE_FILE, queue)
-
-def process_queue_once():
-    if not queue:
-        return
-    text = queue.pop(0)
-    save_json(QUEUE_FILE, queue)
-    post(text, breaking=False)
-    log.info("یک خبر از صف منتشر شد.")
 
 # -----------------------------
 # خواندن کانال‌های تلگرام منبع
@@ -271,18 +262,15 @@ def run_cycle_rss():
             try:
                 text = future.result()
                 combined = article["title"] + " " + article["summary"]
-                if is_breaking_text(combined):
-                    post(text, breaking=True)
-                    log.info(f"خبر RSS فوری منتشر شد: {article['title'][:50]}")
-                else:
-                    add_to_queue(text)
-                    log.info(f"خبر RSS به صف اضافه شد: {article['title'][:50]}")
-                seen.add(article["id"])
+                post(text, breaking=is_breaking_text(combined))
+                log.info(f"خبر RSS منتشر شد: {article['title'][:50]}")
+                with _seen_lock:
+                    seen.add(article["id"])
+                    save_json(SEEN_FILE, list(seen))
                 time.sleep(1)
             except Exception as e:
                 log.error(f"خطا در پردازش خبر RSS «{article['title'][:40]}»: {e}")
 
-    save_json(SEEN_FILE, list(seen))
     log.info(f"پایان چرخه RSS — {len(fresh)} خبر پردازش شد.")
 
 # -----------------------------
@@ -302,12 +290,8 @@ def run_cycle_channels():
             raw = futures[future]
             try:
                 text = future.result()
-                if is_breaking_text(raw):
-                    post(text, breaking=True)
-                    log.info("پیام کانال منبع به‌صورت فوری منتشر شد.")
-                else:
-                    add_to_queue(text)
-                    log.info("پیام کانال منبع به صف اضافه شد.")
+                post(text, breaking=is_breaking_text(raw))
+                log.info("پیام کانال منبع منتشر شد.")
                 time.sleep(1)
             except Exception as e:
                 log.error(f"خطا در پردازش پیام کانال منبع: {e}")
@@ -330,7 +314,6 @@ def main():
         schedule.every().day.at(t).do(run_cycle_rss)
 
     schedule.every(BREAKING_CHECK_MINUTES).minutes.do(run_cycle_channels)
-    schedule.every(QUEUE_POST_INTERVAL_MIN).minutes.do(process_queue_once)
 
     # اجرای اولیه
     run_cycle_rss()
