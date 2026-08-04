@@ -7,6 +7,7 @@ import time
 import hashlib
 import logging
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import feedparser
 import requests
@@ -25,10 +26,13 @@ GROQ_MODEL = "llama-3.1-8b-instant"
 CHANNEL_NAME = "پتک نیوز"
 SEEN_FILE = Path("seen.json")
 CACHE_FILE = Path("cache.json")
+QUEUE_FILE = Path("queue.json")
+LAST_UPDATE_ID_FILE = Path("last_update_id.json")
 
-MAX_ITEMS_PER_RUN = 3
+MAX_ITEMS_PER_RUN = 5          # تعداد خبر RSS در هر چرخه
 RUN_TIMES = ["08:00", "12:00", "16:00", "20:00"]
-BREAKING_CHECK_MINUTES = 20
+BREAKING_CHECK_MINUTES = 20    # بررسی کانال‌های منبع
+QUEUE_POST_INTERVAL_MIN = 60   # هر چند دقیقه یک خبر از صف
 
 SOURCE_CHANNEL_USERNAMES = ["RoidBest", "khabari_18"]  # بدون @
 
@@ -44,9 +48,9 @@ RSS_FEEDS = [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [پتک‌نیوز] %(message)s")
 log = logging.getLogger("petak-news")
 
-seen = set()
-queue_file = Path("queue.json")
-
+# -----------------------------
+# فایل‌های حافظه
+# -----------------------------
 def load_json(path, default):
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
@@ -57,7 +61,8 @@ def save_json(path, data):
 
 seen = set(load_json(SEEN_FILE, []))
 cache = load_json(CACHE_FILE, {})
-queue = load_json(queue_file, [])
+queue = load_json(QUEUE_FILE, [])
+last_update_id = load_json(LAST_UPDATE_ID_FILE, 0)
 
 # -----------------------------
 # ابزارهای کمکی
@@ -100,7 +105,7 @@ def call_groq(prompt):
     return data["choices"][0]["message"]["content"].strip()
 
 # -----------------------------
-# بازنویسی خبر (RSS یا کانال)
+# بازنویسی متن (Ultra Fast با کش)
 # -----------------------------
 def rewrite_text(raw_text, source_label=""):
     aid = article_id_from_text(raw_text)
@@ -127,25 +132,20 @@ def rewrite_text(raw_text, source_label=""):
 {raw_text}
 """
 
-    try:
-        result = call_groq(prompt)
-    except RuntimeError as e:
-        log.error(f"خطا در بازنویسی با Groq: {e}")
-        raise
-
+    result = call_groq(prompt)
     cache[aid] = result
     save_json(CACHE_FILE, cache)
     return result
 
 def rewrite_article(article):
     text = f"عنوان: {article['title']}\n\nخلاصه:\n{article['summary']}"
-    return rewrite_text(text, source_label=article["source"])
+    source_label = article.get("source", "RSS")
+    return rewrite_text(text, source_label=source_label)
 
 # -----------------------------
 # تشخیص خبر فوری
 # -----------------------------
 def is_breaking_text(text):
-    # ساده: اگر کلمات کلیدی باشد، فوری
     keywords = ["فوری", "خبر فوری", "urgent", "breaking"]
     t = text.lower()
     return any(k in t for k in keywords)
@@ -168,11 +168,23 @@ def post(text, breaking=False):
     return True
 
 # -----------------------------
-# خواندن کانال‌های تلگرام (منبع)
+# صف خبرهای معمولی
 # -----------------------------
-LAST_UPDATE_ID_FILE = Path("last_update_id.json")
-last_update_id = load_json(LAST_UPDATE_ID_FILE, 0)
+def add_to_queue(text):
+    queue.append(text)
+    save_json(QUEUE_FILE, queue)
 
+def process_queue_once():
+    if not queue:
+        return
+    text = queue.pop(0)
+    save_json(QUEUE_FILE, queue)
+    post(text, breaking=False)
+    log.info("یک خبر از صف منتشر شد.")
+
+# -----------------------------
+# خواندن کانال‌های تلگرام منبع
+# -----------------------------
 def fetch_from_source_channels():
     global last_update_id
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
@@ -231,25 +243,12 @@ def fetch_new_articles():
                 "id": aid,
                 "title": entry.get("title", "").strip(),
                 "summary": entry.get("summary", "")[:1500],
+                "source": parsed.feed.get("title", "RSS"),
             })
     return fresh
 
 # -----------------------------
-# صف خبرهای معمولی
-# -----------------------------
-def add_to_queue(text):
-    queue.append(text)
-    save_json(queue_file, queue)
-
-def process_queue_once():
-    if not queue:
-        return
-    text = queue.pop(0)
-    save_json(queue_file, queue)
-    post(text, breaking=False)
-
-# -----------------------------
-# چرخه‌ی اصلی RSS
+# چرخه‌ی RSS (Ultra Fast با ThreadPool)
 # -----------------------------
 def run_cycle_rss():
     log.info("شروع بررسی خبرهای جدید RSS...")
@@ -259,29 +258,35 @@ def run_cycle_rss():
         log.info("خبر جدیدی از RSS نیست.")
         return
 
-    published = 0
-    for article in fresh:
-        if published >= MAX_ITEMS_PER_RUN:
-            break
+    # فقط تعداد محدود برای جلوگیری از Rate Limit
+    fresh = fresh[:MAX_ITEMS_PER_RUN]
 
-        try:
-            text = rewrite_article(article)
-            if is_breaking_text(article["title"] + " " + article["summary"]):
-                post(text, breaking=True)
-            else:
-                add_to_queue(text)
-            seen.add(article["id"])
-            published += 1
-            log.info(f"خبر RSS پردازش شد: {article['title'][:50]}")
-            time.sleep(2)
-        except Exception as e:
-            log.error(f"خطا در پردازش خبر RSS «{article['title'][:40]}»: {e}")
+    futures = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for article in fresh:
+            futures[executor.submit(rewrite_article, article)] = article
+
+        for future in as_completed(futures):
+            article = futures[future]
+            try:
+                text = future.result()
+                combined = article["title"] + " " + article["summary"]
+                if is_breaking_text(combined):
+                    post(text, breaking=True)
+                    log.info(f"خبر RSS فوری منتشر شد: {article['title'][:50]}")
+                else:
+                    add_to_queue(text)
+                    log.info(f"خبر RSS به صف اضافه شد: {article['title'][:50]}")
+                seen.add(article["id"])
+                time.sleep(1)
+            except Exception as e:
+                log.error(f"خطا در پردازش خبر RSS «{article['title'][:40]}»: {e}")
 
     save_json(SEEN_FILE, list(seen))
-    log.info(f"پایان چرخه RSS — {published} خبر پردازش شد.")
+    log.info(f"پایان چرخه RSS — {len(fresh)} خبر پردازش شد.")
 
 # -----------------------------
-# چرخه‌ی کانال‌های تلگرام
+# چرخه‌ی کانال‌های تلگرام (Ultra Fast)
 # -----------------------------
 def run_cycle_channels():
     log.info("بررسی کانال‌های تلگرام منبع...")
@@ -290,17 +295,22 @@ def run_cycle_channels():
         log.info("پیام جدیدی از کانال‌های منبع نیست.")
         return
 
-    for raw in msgs:
-        try:
-            text = rewrite_text(raw_text=raw, source_label="کانال تلگرام")
-            if is_breaking_text(raw):
-                post(text, breaking=True)
-            else:
-                add_to_queue(text)
-            log.info("پیام کانال منبع پردازش شد.")
-            time.sleep(1)
-        except Exception as e:
-            log.error(f"خطا در پردازش پیام کانال منبع: {e}")
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(rewrite_text, raw, "کانال تلگرام"): raw for raw in msgs}
+
+        for future in as_completed(futures):
+            raw = futures[future]
+            try:
+                text = future.result()
+                if is_breaking_text(raw):
+                    post(text, breaking=True)
+                    log.info("پیام کانال منبع به‌صورت فوری منتشر شد.")
+                else:
+                    add_to_queue(text)
+                    log.info("پیام کانال منبع به صف اضافه شد.")
+                time.sleep(1)
+            except Exception as e:
+                log.error(f"خطا در پردازش پیام کانال منبع: {e}")
 
 # -----------------------------
 # اجرای اصلی
@@ -315,12 +325,12 @@ def main():
         log.error("GROQ_API_KEY تنظیم نشده است.")
         return
 
-    # چرخه‌های زمان‌بندی‌شده
+    # زمان‌بندی‌ها
     for t in RUN_TIMES:
         schedule.every().day.at(t).do(run_cycle_rss)
 
     schedule.every(BREAKING_CHECK_MINUTES).minutes.do(run_cycle_channels)
-    schedule.every().hour.do(process_queue_once)
+    schedule.every(QUEUE_POST_INTERVAL_MIN).minutes.do(process_queue_once)
 
     # اجرای اولیه
     run_cycle_rss()
