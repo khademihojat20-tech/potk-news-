@@ -4,6 +4,7 @@
 import os
 import json
 import time
+import re
 import hashlib
 import logging
 import threading
@@ -157,14 +158,56 @@ def is_breaking_text(text):
     return any(k in t for k in keywords)
 
 # -----------------------------
+# استخراج عکس از فید RSS
+# -----------------------------
+def extract_image_from_entry(entry):
+    # ۱) media_content یا media_thumbnail (رایج در بیشتر فیدهای خبری)
+    for key in ("media_content", "media_thumbnail"):
+        media = entry.get(key)
+        if media:
+            url = media[0].get("url")
+            if url:
+                return url
+
+    # ۲) enclosure (لینک ضمیمه با نوع عکس)
+    for link in entry.get("links", []):
+        if link.get("type", "").startswith("image/"):
+            return link.get("href")
+
+    # ۳) جستجوی تگ <img> داخل خلاصه/توضیحات HTML
+    html = entry.get("summary", "") or entry.get("description", "")
+    match = re.search(r'<img[^>]+src="([^"]+)"', html)
+    if match:
+        return match.group(1)
+
+    return None
+
+# -----------------------------
 # ارسال به تلگرام
 # -----------------------------
-def post(text, breaking=False):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+def post(text, breaking=False, image_url=None):
     prefix = "🚨 <b>خبر فوری</b>\n\n" if breaking else ""
+    full_text = f"{prefix}{text}\n\n📡 {CHANNEL_NAME}"
+
+    if image_url:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        payload = {
+            "chat_id": TELEGRAM_CHANNEL_ID,
+            "photo": image_url,
+            # کپشن تلگرام حداکثر ۱۰۲۴ کاراکتر است
+            "caption": full_text[:1024],
+            "parse_mode": "HTML",
+        }
+        r = requests.post(url, json=payload, timeout=20)
+        if r.status_code == 200:
+            return True
+        log.warning(f"ارسال عکس ناموفق بود ({r.status_code})، پیام به‌صورت متنی ارسال می‌شود.")
+        # اگر عکس شکست خورد، به حالت متنی ساده برمی‌گردیم
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHANNEL_ID,
-        "text": f"{prefix}{text}\n\n📡 {CHANNEL_NAME}",
+        "text": full_text,
         "parse_mode": "HTML",
     }
     r = requests.post(url, json=payload, timeout=20)
@@ -206,10 +249,14 @@ def fetch_from_source_channels():
         chat = msg.get("chat", {})
         username = chat.get("username", "")
         if username in SOURCE_CHANNEL_USERNAMES:
-            text = msg.get("text") or ""
+            text = msg.get("text") or msg.get("caption") or ""
             if not text.strip():
                 continue
-            messages.append(text)
+            photo_file_id = None
+            if msg.get("photo"):
+                # بزرگ‌ترین سایز عکس آخرین آیتم لیست است
+                photo_file_id = msg["photo"][-1]["file_id"]
+            messages.append({"text": text, "photo_file_id": photo_file_id})
 
     save_json(LAST_UPDATE_ID_FILE, last_update_id)
     return messages
@@ -235,6 +282,7 @@ def fetch_new_articles():
                 "title": entry.get("title", "").strip(),
                 "summary": entry.get("summary", "")[:1500],
                 "source": parsed.feed.get("title", "RSS"),
+                "image_url": extract_image_from_entry(entry),
             })
     return fresh
 
@@ -262,7 +310,7 @@ def run_cycle_rss():
             try:
                 text = future.result()
                 combined = article["title"] + " " + article["summary"]
-                post(text, breaking=is_breaking_text(combined))
+                post(text, breaking=is_breaking_text(combined), image_url=article.get("image_url"))
                 log.info(f"خبر RSS منتشر شد: {article['title'][:50]}")
                 with _seen_lock:
                     seen.add(article["id"])
@@ -284,13 +332,13 @@ def run_cycle_channels():
         return
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(rewrite_text, raw, "کانال تلگرام"): raw for raw in msgs}
+        futures = {executor.submit(rewrite_text, m["text"], "کانال تلگرام"): m for m in msgs}
 
         for future in as_completed(futures):
-            raw = futures[future]
+            m = futures[future]
             try:
                 text = future.result()
-                post(text, breaking=is_breaking_text(raw))
+                post(text, breaking=is_breaking_text(m["text"]), image_url=m.get("photo_file_id"))
                 log.info("پیام کانال منبع منتشر شد.")
                 time.sleep(1)
             except Exception as e:
