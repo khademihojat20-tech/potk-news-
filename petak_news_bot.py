@@ -1,28 +1,5 @@
 #!/usr/bin/env python3
-"""
-پتک نیوز — ربات کاملاً خودکار انتشار اخبار اقتصاد و تکنولوژی در تلگرام
-=======================================================================
-
-نحوه‌ی کار:
-  1) از یک لیست فید RSS (اقتصاد و تکنولوژی) خبرهای جدید را می‌خواند.
-  2) خبرهایی که قبلاً منتشر نشده‌اند را تشخیص می‌دهد (فایل seen.json).
-  3) هر خبر را با مدل رایگان Google Gemini به فارسیِ روان و در قالب خبری بازنویسی/خلاصه می‌کند.
-  4) پست نهایی را با برندینگ «پتک نیوز» در کانال تلگرام منتشر می‌کند.
-  5) به صورت زمان‌بندی‌شده (چند بار در روز) در پس‌زمینه اجرا می‌شود.
-
-شما فقط باید:
-  - یک ربات تلگرام از @BotFather بسازید و توکنش را بگیرید.
-  - ربات را ادمین کانال «پتک نیوز» کنید (با اجازه‌ی ارسال پیام).
-  - یک API Key رایگان از Google AI Studio بگیرید: https://aistudio.google.com/apikey
-  - مقادیر زیر را در متغیرهای محیطی (environment variables) قرار دهید:
-        TELEGRAM_BOT_TOKEN
-        TELEGRAM_CHANNEL_ID     (مثلاً: @petak_news یا -1001234567890)
-        GEMINI_API_KEY
-
-اجرا:
-    pip install feedparser requests google-genai schedule --break-system-packages
-    python3 petak_news_bot.py
-"""
+# -*- coding: utf-8 -*-
 
 import os
 import json
@@ -36,230 +13,219 @@ import requests
 import schedule
 from google import genai
 
-# ------------------------------------------------------------------
+# -----------------------------
 # تنظیمات
-# ------------------------------------------------------------------
-
+# -----------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-2.5-flash"   # مدل رایگان و سریع گوگل
+GEMINI_MODEL = "gemini-2.5-flash"
 
 CHANNEL_NAME = "پتک نیوز"
-SEEN_FILE = Path(__file__).parent / "seen.json"
-MAX_ITEMS_PER_RUN = 4          # حداکثر چند خبر در هر بار اجرا منتشر شود
-RUN_TIMES = ["08:00", "12:00", "16:00", "20:00"]   # چند بار در روز (به وقت سرور)
-BREAKING_CHECK_MINUTES = 15     # هر چند دقیقه یک‌بار دنبال خبر فوری بگردد
+SEEN_FILE = Path("seen.json")
+CACHE_FILE = Path("cache.json")
 
-# فیدهای RSS — می‌توانید هرکدام را حذف/اضافه کنید
+MAX_ITEMS_PER_RUN = 3
+RUN_TIMES = ["08:00", "12:00", "16:00", "20:00"]
+BREAKING_CHECK_MINUTES = 20
+
 RSS_FEEDS = [
-    # اقتصاد
     "https://www.donya-e-eqtesad.com/rss",
     "https://www.eghtesadnews.com/rss",
     "https://www.reuters.com/business/finance/rss",
-    # تکنولوژی
     "https://www.zoomit.ir/feed/",
     "https://digiato.com/feed",
     "https://techcrunch.com/feed/",
 ]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [پتک‌نیوز] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [پتک‌نیوز] %(message)s")
 log = logging.getLogger("petak-news")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# -----------------------------
+# فایل‌های حافظه
+# -----------------------------
+def load_json(path, default):
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return default
 
-# ------------------------------------------------------------------
-# مدیریت خبرهای دیده‌شده (جلوگیری از تکرار)
-# ------------------------------------------------------------------
+def save_json(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
-def load_seen() -> set:
-    if SEEN_FILE.exists():
-        return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
-    return set()
+seen = set(load_json(SEEN_FILE, []))
+cache = load_json(CACHE_FILE, {})
 
-
-def save_seen(seen: set) -> None:
-    # فقط ۵۰۰ مورد آخر را نگه می‌داریم که فایل بزرگ نشود
-    trimmed = list(seen)[-500:]
-    SEEN_FILE.write_text(json.dumps(trimmed, ensure_ascii=False), encoding="utf-8")
-
-
-def article_id(entry) -> str:
+# -----------------------------
+# ابزارهای کمکی
+# -----------------------------
+def article_id(entry):
     base = entry.get("id") or entry.get("link") or entry.get("title", "")
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
+def rate_limited_call(prompt):
+    """تماس امن با Gemini — با مدیریت خطای 429"""
+    while True:
+        try:
+            resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            return (resp.text or "").strip()
+        except Exception as e:
+            if "429" in str(e):
+                log.warning("سهمیه‌ی Gemini پر شده — صبر می‌کنیم...")
+                time.sleep(15)
+                continue
+            raise e
 
-# ------------------------------------------------------------------
-# جمع‌آوری خبرهای جدید از همه‌ی فیدها
-# ------------------------------------------------------------------
-
-def fetch_new_articles(seen: set):
+# -----------------------------
+# جمع‌آوری خبرهای جدید
+# -----------------------------
+def fetch_new_articles():
     fresh = []
     for url in RSS_FEEDS:
         try:
             parsed = feedparser.parse(url)
         except Exception as e:
-            log.warning(f"خطا در خواندن فید {url}: {e}")
+            log.warning(f"خطا در فید {url}: {e}")
             continue
 
-        for entry in parsed.entries[:8]:
+        for entry in parsed.entries[:6]:
             aid = article_id(entry)
             if aid in seen:
                 continue
             fresh.append({
                 "id": aid,
                 "title": entry.get("title", "").strip(),
-                "summary": entry.get("summary", "")[:1200],
+                "summary": entry.get("summary", "")[:1500],
                 "link": entry.get("link", ""),
                 "source": parsed.feed.get("title", url),
             })
     return fresh
 
+# -----------------------------
+# بازنویسی کامل — با کش
+# -----------------------------
+def rewrite(article):
+    if article["id"] in cache:
+        return cache[article["id"]]
 
-# ------------------------------------------------------------------
-# بازنویسی/ترجمه‌ی خبر به فارسی با Claude
-# ------------------------------------------------------------------
-
-def rewrite_in_persian(article: dict) -> str:
-    prompt = f"""تو خبرنگار کانال خبری «پتک نیوز» هستی. متن زیر را بخوان و یک پست خبری کوتاه، دقیق و روان به زبان فارسی بنویس.
+    prompt = f"""
+تو خبرنگار حرفه‌ای کانال خبری «پتک نیوز» هستی.
+متن زیر را کامل بخوان و یک خبر تازه، منسجم و قابل‌فهم برای مخاطب فارسی‌زبان بنویس.
 
 قوانین:
-- عنوان کوتاه و جذاب در خط اول (با ایموجی مناسب موضوع در ابتدا).
-- بدنه‌ی خبر در ۲ تا ۴ جمله، فقط واقعیت‌ها، بدون نظر شخصی.
+- در خط اول، یک عنوان خبری کوتاه و جذاب با ایموجی مرتبط بنویس.
+- در بدنه، ۳ تا ۶ جمله بنویس که:
+  - ماجرا را از ابتدا تا انتها توضیح دهد،
+  - نکات مهم، اعداد، نام‌ها و زمان‌ها را حفظ کند،
+  - هیچ تحلیل شخصی یا نظر اضافه نداشته باشد.
+- اگر متن اصلی پراکنده است، آن را منظم و قابل‌فهم کن.
 - در پایان، یک خط منبع بنویس: «منبع: {article['source']}»
 - در انتها ۲ تا ۳ هشتگ فارسی مرتبط اضافه کن.
-- هیچ متنی از خودت (مثل «البته» یا مقدمه) اضافه نکن، فقط خروجی نهایی پست را بده.
+- از خودت مقدمه یا توضیح اضافه نکن؛ فقط متن نهایی پست خبری را بده.
 
-عنوان اصلی خبر: {article['title']}
-خلاصه/متن خبر: {article['summary']}
+عنوان اصلی خبر:
+{article['title']}
+
+متن/خلاصه خبر:
+{article['summary']}
 """
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-    )
-    return (resp.text or "").strip()
 
+    result = rate_limited_call(prompt)
+    cache[article["id"]] = result
+    save_json(CACHE_FILE, cache)
+    return result
 
-# ------------------------------------------------------------------
-# تشخیص خبر فوری/مهم
-# ------------------------------------------------------------------
+# -----------------------------
+# تشخیص خبر فوری — کم‌مصرف
+# -----------------------------
+def is_breaking(article):
+    prompt = f"""
+عنوان خبر: {article['title']}
 
-def is_breaking_news(article: dict) -> bool:
-    """با کمک مدل تشخیص می‌دهد آیا این خبر به‌اندازه‌ای مهم است که فوری منتشر شود."""
-    prompt = f"""عنوان خبر: {article['title']}
-خلاصه: {article['summary'][:500]}
-
-آیا این خبر به قدری مهم/فوری است که باید بلافاصله و جدا از انتشار معمول در یک کانال خبری اقتصاد و تکنولوژی اطلاع‌رسانی شود؟
-معیار «مهم»: اتفاقات بزرگ و تأثیرگذار مثل تغییرات ناگهانی نرخ ارز/بازار، تحریم یا رفع تحریم، ورشکستگی یا سقوط شرکت بزرگ، حمله‌ی سایبری گسترده، تصمیم مهم بانک مرکزی/فدرال‌رزرو، عرضه‌ی محصول یا فناوری بسیار بزرگ (مثلاً از اپل/گوگل/OpenAI)، یا رویدادهای مشابه با تأثیر گسترده.
-خبرهای عادی و روزمره (تحلیل‌های کلی، گزارش‌های معمولی، اخبار کوچک شرکتی) را «مهم» در نظر نگیر.
-
-فقط با یک کلمه پاسخ بده: بله یا خیر"""
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-    )
-    answer = (resp.text or "").strip()
+آیا این خبر مهم و فوری است؟ فقط بله یا خیر.
+"""
+    answer = rate_limited_call(prompt)
     return answer.startswith("بله")
 
-
-# ------------------------------------------------------------------
+# -----------------------------
 # ارسال به تلگرام
-# ------------------------------------------------------------------
-
-def post_to_telegram(text: str, link: str, breaking: bool = False) -> bool:
+# -----------------------------
+def post(text, link, breaking=False):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     prefix = "🚨 <b>خبر فوری</b>\n\n" if breaking else ""
-    full_text = f"{prefix}{text}\n\n🔗 {link}\n\n📡 {CHANNEL_NAME}"
     payload = {
         "chat_id": TELEGRAM_CHANNEL_ID,
-        "text": full_text,
+        "text": f"{prefix}{text}\n\n🔗 {link}\n\n📡 {CHANNEL_NAME}",
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,
     }
-    r = requests.post(url, json=payload, timeout=20)
-    if r.status_code != 200:
-        log.error(f"ارسال به تلگرام ناموفق بود: {r.text}")
-        return False
-    return True
+    r = requests.post(url, json=payload)
+    return r.status_code == 200
 
-
-# ------------------------------------------------------------------
+# -----------------------------
 # چرخه‌ی اصلی
-# ------------------------------------------------------------------
-
+# -----------------------------
 def run_cycle():
-    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GEMINI_API_KEY]):
-        log.error("متغیرهای محیطی TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID / GEMINI_API_KEY تنظیم نشده‌اند.")
-        return
-
     log.info("شروع بررسی خبرهای جدید...")
-    seen = load_seen()
-    fresh = fetch_new_articles(seen)
+    fresh = fetch_new_articles()
 
     if not fresh:
-        log.info("خبر جدیدی پیدا نشد.")
+        log.info("خبر جدیدی نیست.")
         return
 
     published = 0
     for article in fresh:
         if published >= MAX_ITEMS_PER_RUN:
             break
+
         try:
-            persian_post = rewrite_in_persian(article)
-            ok = post_to_telegram(persian_post, article["link"])
-            if ok:
+            text = rewrite(article)
+            if post(text, article["link"]):
                 seen.add(article["id"])
                 published += 1
-                log.info(f"منتشر شد: {article['title'][:60]}")
-                time.sleep(3)  # فاصله‌ی کوتاه بین پست‌ها
+                log.info(f"منتشر شد: {article['title'][:50]}")
+                time.sleep(2)
         except Exception as e:
-            log.error(f"خطا در پردازش خبر «{article['title'][:40]}»: {e}")
+            log.error(f"خطا در پردازش: {e}")
 
-    save_seen(seen)
+    save_json(SEEN_FILE, list(seen))
     log.info(f"پایان چرخه — {published} خبر منتشر شد.")
 
-
-def check_breaking_news():
-    """هر چند دقیقه یک‌بار اجرا می‌شود؛ فقط اخبار واقعاً مهم را فوری منتشر می‌کند."""
-    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GEMINI_API_KEY]):
-        return
-
-    seen = load_seen()
-    fresh = fetch_new_articles(seen)
+# -----------------------------
+# خبر فوری
+# -----------------------------
+def check_breaking():
+    fresh = fetch_new_articles()
     if not fresh:
         return
 
     for article in fresh:
         try:
-            if is_breaking_news(article):
-                persian_post = rewrite_in_persian(article)
-                ok = post_to_telegram(persian_post, article["link"], breaking=True)
-                if ok:
+            if is_breaking(article):
+                text = rewrite(article)
+                if post(text, article["link"], breaking=True):
                     seen.add(article["id"])
-                    log.info(f"🚨 خبر فوری منتشر شد: {article['title'][:60]}")
-                    save_seen(seen)
+                    save_json(SEEN_FILE, list(seen))
+                    log.info(f"🚨 خبر فوری منتشر شد: {article['title'][:50]}")
         except Exception as e:
-            log.error(f"خطا در بررسی خبر فوری «{article['title'][:40]}»: {e}")
+            log.error(f"خطا در خبر فوری: {e}")
 
-
+# -----------------------------
+# اجرای اصلی
+# -----------------------------
 def main():
-    log.info(f"{CHANNEL_NAME} — ربات خودکار راه‌اندازی شد.")
+    log.info("پتک نیوز — ربات راه‌اندازی شد.")
+
     for t in RUN_TIMES:
         schedule.every().day.at(t).do(run_cycle)
 
-    schedule.every(BREAKING_CHECK_MINUTES).minutes.do(check_breaking_news)
+    schedule.every(BREAKING_CHECK_MINUTES).minutes.do(check_breaking)
 
-    # یک بار هم موقع استارت اجرا شود
     run_cycle()
 
     while True:
         schedule.run_pending()
-        time.sleep(30)
-
+        time.sleep(20)
 
 if __name__ == "__main__":
     main()
