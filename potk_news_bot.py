@@ -6,21 +6,21 @@
 نحوه‌ی کار:
   1) از یک لیست فید RSS (اقتصاد و تکنولوژی) خبرهای جدید را می‌خواند.
   2) خبرهایی که قبلاً منتشر نشده‌اند را تشخیص می‌دهد (فایل seen.json).
-  3) هر خبر را با مدل Claude به فارسیِ روان و در قالب خبری بازنویسی/خلاصه می‌کند.
+  3) هر خبر را با مدل رایگان Google Gemini به فارسیِ روان و در قالب خبری بازنویسی/خلاصه می‌کند.
   4) پست نهایی را با برندینگ «پتک نیوز» در کانال تلگرام منتشر می‌کند.
   5) به صورت زمان‌بندی‌شده (چند بار در روز) در پس‌زمینه اجرا می‌شود.
 
 شما فقط باید:
   - یک ربات تلگرام از @BotFather بسازید و توکنش را بگیرید.
   - ربات را ادمین کانال «پتک نیوز» کنید (با اجازه‌ی ارسال پیام).
-  - یک API Key از Anthropic بگیرید.
+  - یک API Key رایگان از Google AI Studio بگیرید: https://aistudio.google.com/apikey
   - مقادیر زیر را در متغیرهای محیطی (environment variables) قرار دهید:
         TELEGRAM_BOT_TOKEN
         TELEGRAM_CHANNEL_ID     (مثلاً: @petak_news یا -1001234567890)
-        ANTHROPIC_API_KEY
+        GEMINI_API_KEY
 
 اجرا:
-    pip install feedparser requests anthropic schedule --break-system-packages
+    pip install feedparser requests google-genai schedule --break-system-packages
     python3 petak_news_bot.py
 """
 
@@ -34,7 +34,7 @@ from pathlib import Path
 import feedparser
 import requests
 import schedule
-from anthropic import Anthropic
+from google import genai
 
 # ------------------------------------------------------------------
 # تنظیمات
@@ -42,7 +42,8 @@ from anthropic import Anthropic
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-2.5-flash"   # مدل رایگان و سریع گوگل
 
 CHANNEL_NAME = "پتک نیوز"
 SEEN_FILE = Path(__file__).parent / "seen.json"
@@ -68,7 +69,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("petak-news")
 
-client = Anthropic(api_key=ANTHROPIC_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # ------------------------------------------------------------------
@@ -136,13 +137,11 @@ def rewrite_in_persian(article: dict) -> str:
 عنوان اصلی خبر: {article['title']}
 خلاصه/متن خبر: {article['summary']}
 """
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}],
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
     )
-    text = "".join(block.text for block in resp.content if block.type == "text")
-    return text.strip()
+    return (resp.text or "").strip()
 
 
 # ------------------------------------------------------------------
@@ -159,12 +158,11 @@ def is_breaking_news(article: dict) -> bool:
 خبرهای عادی و روزمره (تحلیل‌های کلی، گزارش‌های معمولی، اخبار کوچک شرکتی) را «مهم» در نظر نگیر.
 
 فقط با یک کلمه پاسخ بده: بله یا خیر"""
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=10,
-        messages=[{"role": "user", "content": prompt}],
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
     )
-    answer = "".join(b.text for b in resp.content if b.type == "text").strip()
+    answer = (resp.text or "").strip()
     return answer.startswith("بله")
 
 
@@ -194,8 +192,8 @@ def post_to_telegram(text: str, link: str, breaking: bool = False) -> bool:
 # ------------------------------------------------------------------
 
 def run_cycle():
-    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ANTHROPIC_API_KEY]):
-        log.error("متغیرهای محیطی TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID / ANTHROPIC_API_KEY تنظیم نشده‌اند.")
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GEMINI_API_KEY]):
+        log.error("متغیرهای محیطی TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID / GEMINI_API_KEY تنظیم نشده‌اند.")
         return
 
     log.info("شروع بررسی خبرهای جدید...")
@@ -227,7 +225,7 @@ def run_cycle():
 
 def check_breaking_news():
     """هر چند دقیقه یک‌بار اجرا می‌شود؛ فقط اخبار واقعاً مهم را فوری منتشر می‌کند."""
-    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ANTHROPIC_API_KEY]):
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GEMINI_API_KEY]):
         return
 
     seen = load_seen()
