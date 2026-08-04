@@ -18,9 +18,9 @@ import schedule
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
 
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
-DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
-DEEPSEEK_MODEL = "deepseek-chat"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 CHANNEL_NAME = "پتک نیوز"
 SEEN_FILE = Path("seen.json")
@@ -64,29 +64,34 @@ def article_id(entry):
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 # -----------------------------
-# تماس با DeepSeek
+# تماس با Groq
 # -----------------------------
-def call_deepseek(prompt):
+def call_groq(prompt):
+    if not GROQ_API_KEY:
+        log.error("متغیر محیطی GROQ_API_KEY تنظیم نشده است.")
+        raise RuntimeError("GROQ_API_KEY_MISSING")
+
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
     }
 
     payload = {
-        "model": DEEPSEEK_MODEL,
+        "model": GROQ_MODEL,
         "messages": [
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.4
+        "temperature": 0.4,
     }
 
-    r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=30)
+    r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
 
     if r.status_code != 200:
-        log.error(f"خطا در DeepSeek: {r.text}")
-        raise RuntimeError("DEEPSEEK_ERROR")
+        log.error(f"خطا در Groq: {r.status_code} {r.text}")
+        raise RuntimeError("GROQ_ERROR")
 
-    return r.json()["choices"][0]["message"]["content"].strip()
+    data = r.json()
+    return data["choices"][0]["message"]["content"].strip()
 
 # -----------------------------
 # جمع‌آوری خبرهای جدید
@@ -142,7 +147,12 @@ def rewrite(article):
 {article['summary']}
 """
 
-    result = call_deepseek(prompt)
+    try:
+        result = call_groq(prompt)
+    except RuntimeError as e:
+        log.error(f"خطا در بازنویسی با Groq: {e}")
+        raise
+
     cache[article["id"]] = result
     save_json(CACHE_FILE, cache)
     return result
@@ -156,8 +166,13 @@ def is_breaking(article):
 
 آیا این خبر مهم و فوری است؟ فقط بله یا خیر.
 """
-    answer = call_deepseek(prompt)
-    return answer.startswith("بله")
+    try:
+        answer = call_groq(prompt)
+    except RuntimeError as e:
+        log.error(f"خطا در تشخیص خبر فوری با Groq: {e}")
+        return False
+
+    return answer.strip().startswith("بله")
 
 # -----------------------------
 # ارسال به تلگرام
@@ -170,8 +185,11 @@ def post(text, link, breaking=False):
         "text": f"{prefix}{text}\n\n🔗 {link}\n\n📡 {CHANNEL_NAME}",
         "parse_mode": "HTML",
     }
-    r = requests.post(url, json=payload)
-    return r.status_code == 200
+    r = requests.post(url, json=payload, timeout=20)
+    if r.status_code != 200:
+        log.error(f"ارسال به تلگرام ناموفق بود: {r.status_code} {r.text}")
+        return False
+    return True
 
 # -----------------------------
 # چرخه‌ی اصلی
@@ -197,7 +215,7 @@ def run_cycle():
                 log.info(f"منتشر شد: {article['title'][:50]}")
                 time.sleep(2)
         except Exception as e:
-            log.error(f"خطا در پردازش: {e}")
+            log.error(f"خطا در پردازش خبر «{article['title'][:40]}»: {e}")
 
     save_json(SEEN_FILE, list(seen))
     log.info(f"پایان چرخه — {published} خبر منتشر شد.")
@@ -219,7 +237,7 @@ def check_breaking():
                     save_json(SEEN_FILE, list(seen))
                     log.info(f"🚨 خبر فوری منتشر شد: {article['title'][:50]}")
         except Exception as e:
-            log.error(f"خطا در خبر فوری: {e}")
+            log.error(f"خطا در خبر فوری «{article['title'][:40]}»: {e}")
 
 # -----------------------------
 # اجرای اصلی
@@ -227,11 +245,16 @@ def check_breaking():
 def main():
     log.info("پتک نیوز — ربات راه‌اندازی شد.")
 
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GROQ_API_KEY]):
+        log.error("متغیرهای محیطی TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID / GROQ_API_KEY تنظیم نشده‌اند.")
+        return
+
     for t in RUN_TIMES:
         schedule.every().day.at(t).do(run_cycle)
 
     schedule.every(BREAKING_CHECK_MINUTES).minutes.do(check_breaking)
 
+    # اجرای فوری یک چرخه در استارت
     run_cycle()
 
     while True:
