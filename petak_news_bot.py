@@ -8,6 +8,7 @@ import re
 import hashlib
 import logging
 import threading
+import difflib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -26,9 +27,20 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 
 CHANNEL_NAME = "پتک نیوز"
-SEEN_FILE = Path("seen.json")
-CACHE_FILE = Path("cache.json")
-LAST_UPDATE_ID_FILE = Path("last_update_id.json")
+
+# مسیر ذخیره‌ی داده‌ها — روی Railway باید یک Volume بسازید و مسیرش را
+# در متغیر محیطی DATA_DIR بدهید (مثلاً /data)، وگرنه با هر ری‌دیپلوی
+# فایل‌های seen/cache پاک می‌شوند و اخبار قدیمی دوباره پست می‌شوند.
+DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+SEEN_FILE = DATA_DIR / "seen.json"
+CACHE_FILE = DATA_DIR / "cache.json"
+LAST_UPDATE_ID_FILE = DATA_DIR / "last_update_id.json"
+RECENT_TITLES_FILE = DATA_DIR / "recent_titles.json"
+
+RECENT_TITLES_MAX = 80          # چند عنوان اخیر برای تشخیص تکرار نگه داشته شود
+TITLE_SIMILARITY_THRESHOLD = 0.72   # بالاتر از این حد = خبر تکراری در نظر گرفته می‌شود
 
 MAX_ITEMS_PER_RUN = 5          # تعداد خبر RSS در هر چرخه
 RUN_TIMES = ["08:00", "12:00", "16:00", "20:00"]
@@ -67,6 +79,23 @@ def save_json(path, data):
 seen = set(load_json(SEEN_FILE, []))
 cache = load_json(CACHE_FILE, {})
 last_update_id = load_json(LAST_UPDATE_ID_FILE, 0)
+recent_titles = load_json(RECENT_TITLES_FILE, [])
+_titles_lock = threading.Lock()
+
+def is_duplicate_title(title):
+    """با مقایسه‌ی شباهت متنی، تشخیص می‌دهد آیا این عنوان همان خبر یک عنوان اخیر است."""
+    with _titles_lock:
+        for t in recent_titles:
+            ratio = difflib.SequenceMatcher(None, title, t).ratio()
+            if ratio >= TITLE_SIMILARITY_THRESHOLD:
+                return True
+    return False
+
+def remember_title(title):
+    with _titles_lock:
+        recent_titles.append(title)
+        del recent_titles[:-RECENT_TITLES_MAX]  # فقط آخرین‌ها نگه داشته شود
+        save_json(RECENT_TITLES_FILE, recent_titles)
 
 # -----------------------------
 # ابزارهای کمکی
@@ -111,7 +140,7 @@ def call_groq(prompt):
 # -----------------------------
 # بازنویسی متن (Ultra Fast با کش)
 # -----------------------------
-def rewrite_text(raw_text, source_label=""):
+def rewrite_text(raw_text, source_label="نامشخص"):
     aid = article_id_from_text(raw_text)
 
     with _cache_lock:
@@ -131,9 +160,8 @@ def rewrite_text(raw_text, source_label=""):
   - هیچ تحلیل شخصی یا نظر اضافه نداشته باشد.
 - هر جمله باید فشرده و پرمعنا باشد؛ چیزی که می‌شود در یک جمله گفت را در دو جمله نگو.
 - هیچ نام کانال، لینک، یوزرنیم یا تبلیغی از متن اصلی را تکرار نکن.
-- در پایان، یک خط منبع کوتاه ثابت بنویس: «🔗 منبع: پتک نیوز»
 - در انتها فقط ۲ هشتگ فارسی مرتبط اضافه کن.
-- فقط متن نهایی پست خبری را بده، بدون هیچ توضیح اضافه.
+- فقط متن نهایی پست خبری را بده، بدون هیچ توضیح اضافه و بدون خط منبع (منبع جداگانه اضافه می‌شود).
 
 متن خبر:
 {raw_text}
@@ -147,8 +175,7 @@ def rewrite_text(raw_text, source_label=""):
 
 def rewrite_article(article):
     text = f"عنوان: {article['title']}\n\nخلاصه:\n{article['summary']}"
-    source_label = article.get("source", "RSS")
-    return rewrite_text(text, source_label=source_label)
+    return rewrite_text(text, source_label=article.get("source", "نامشخص"))
 
 # -----------------------------
 # تشخیص خبر فوری
@@ -211,9 +238,9 @@ def extract_video_from_entry(entry):
 # -----------------------------
 # ارسال به تلگرام
 # -----------------------------
-def post(text, breaking=False, image_url=None, video_url=None):
+def post(text, breaking=False, image_url=None, video_url=None, source_label="نامشخص"):
     prefix = "🚨 <b>خبر فوری</b>\n\n" if breaking else ""
-    full_text = f"{prefix}{text}\n\n📡 {CHANNEL_NAME}"
+    full_text = f"{prefix}{text}\n\n🔗 منبع: {source_label}\n\n📡 {CHANNEL_NAME}"
     # کپشن تلگرام (برای عکس/ویدیو) حداکثر ۱۰۲۴ کاراکتر است
     caption = full_text[:1024]
 
@@ -305,6 +332,7 @@ def fetch_from_source_channels():
                 "text": text,
                 "photo_file_id": photo_file_id,
                 "video_file_id": video_file_id,
+                "source": f"@{username}",
             })
 
     save_json(LAST_UPDATE_ID_FILE, last_update_id)
@@ -350,9 +378,20 @@ def run_cycle_rss():
     # فقط تعداد محدود برای جلوگیری از Rate Limit
     fresh = fresh[:MAX_ITEMS_PER_RUN]
 
+    # قبل از صرف زمان/درخواست مدل، خبرهای با عنوان مشابه را حذف می‌کنیم
+    to_process = []
+    for article in fresh:
+        if is_duplicate_title(article["title"]):
+            log.info(f"خبر تکراری/مشابه رد شد: {article['title'][:50]}")
+            with _seen_lock:
+                seen.add(article["id"])
+                save_json(SEEN_FILE, list(seen))
+            continue
+        to_process.append(article)
+
     futures = {}
     with ThreadPoolExecutor(max_workers=4) as executor:
-        for article in fresh:
+        for article in to_process:
             futures[executor.submit(rewrite_article, article)] = article
 
         for future in as_completed(futures):
@@ -365,8 +404,10 @@ def run_cycle_rss():
                     breaking=is_breaking_text(combined),
                     image_url=article.get("image_url"),
                     video_url=article.get("video_url"),
+                    source_label=article.get("source", "نامشخص"),
                 )
                 log.info(f"خبر RSS منتشر شد: {article['title'][:50]}")
+                remember_title(article["title"])
                 with _seen_lock:
                     seen.add(article["id"])
                     save_json(SEEN_FILE, list(seen))
@@ -374,7 +415,7 @@ def run_cycle_rss():
             except Exception as e:
                 log.error(f"خطا در پردازش خبر RSS «{article['title'][:40]}»: {e}")
 
-    log.info(f"پایان چرخه RSS — {len(fresh)} خبر پردازش شد.")
+    log.info(f"پایان چرخه RSS — {len(to_process)} خبر پردازش شد.")
 
 # -----------------------------
 # چرخه‌ی کانال‌های تلگرام (Ultra Fast)
@@ -387,7 +428,7 @@ def run_cycle_channels():
         return
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(rewrite_text, m["text"], "کانال تلگرام"): m for m in msgs}
+        futures = {executor.submit(rewrite_text, m["text"], m.get("source", "کانال تلگرام")): m for m in msgs}
 
         for future in as_completed(futures):
             m = futures[future]
@@ -398,6 +439,7 @@ def run_cycle_channels():
                     breaking=is_breaking_text(m["text"]),
                     image_url=m.get("photo_file_id"),
                     video_url=m.get("video_file_id"),
+                    source_label=m.get("source", "نامشخص"),
                 )
                 log.info("پیام کانال منبع منتشر شد.")
                 time.sleep(1)
