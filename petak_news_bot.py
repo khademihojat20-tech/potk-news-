@@ -11,15 +11,16 @@ from pathlib import Path
 import feedparser
 import requests
 import schedule
-from google import genai
 
 # -----------------------------
 # تنظیمات
 # -----------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-2.5-flash"
+
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+DEEPSEEK_MODEL = "deepseek-chat"
 
 CHANNEL_NAME = "پتک نیوز"
 SEEN_FILE = Path("seen.json")
@@ -40,8 +41,6 @@ RSS_FEEDS = [
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [پتک‌نیوز] %(message)s")
 log = logging.getLogger("petak-news")
-
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 # -----------------------------
 # فایل‌های حافظه
@@ -64,18 +63,30 @@ def article_id(entry):
     base = entry.get("id") or entry.get("link") or entry.get("title", "")
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
-def rate_limited_call(prompt):
-    """تماس امن با Gemini — با مدیریت خطای 429"""
-    while True:
-        try:
-            resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-            return (resp.text or "").strip()
-        except Exception as e:
-            if "429" in str(e):
-                log.warning("سهمیه‌ی Gemini پر شده — صبر می‌کنیم...")
-                time.sleep(15)
-                continue
-            raise e
+# -----------------------------
+# تماس با DeepSeek
+# -----------------------------
+def call_deepseek(prompt):
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.4
+    }
+
+    r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=30)
+
+    if r.status_code != 200:
+        log.error(f"خطا در DeepSeek: {r.text}")
+        raise RuntimeError("DEEPSEEK_ERROR")
+
+    return r.json()["choices"][0]["message"]["content"].strip()
 
 # -----------------------------
 # جمع‌آوری خبرهای جدید
@@ -122,7 +133,7 @@ def rewrite(article):
 - اگر متن اصلی پراکنده است، آن را منظم و قابل‌فهم کن.
 - در پایان، یک خط منبع بنویس: «منبع: {article['source']}»
 - در انتها ۲ تا ۳ هشتگ فارسی مرتبط اضافه کن.
-- از خودت مقدمه یا توضیح اضافه نکن؛ فقط متن نهایی پست خبری را بده.
+- فقط متن نهایی پست خبری را بده.
 
 عنوان اصلی خبر:
 {article['title']}
@@ -131,13 +142,13 @@ def rewrite(article):
 {article['summary']}
 """
 
-    result = rate_limited_call(prompt)
+    result = call_deepseek(prompt)
     cache[article["id"]] = result
     save_json(CACHE_FILE, cache)
     return result
 
 # -----------------------------
-# تشخیص خبر فوری — کم‌مصرف
+# تشخیص خبر فوری
 # -----------------------------
 def is_breaking(article):
     prompt = f"""
@@ -145,7 +156,7 @@ def is_breaking(article):
 
 آیا این خبر مهم و فوری است؟ فقط بله یا خیر.
 """
-    answer = rate_limited_call(prompt)
+    answer = call_deepseek(prompt)
     return answer.startswith("بله")
 
 # -----------------------------
