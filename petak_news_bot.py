@@ -49,9 +49,16 @@ BREAKING_CHECK_MINUTES = 20    # بررسی کانال‌های منبع
 SOURCE_CHANNEL_USERNAMES = ["RoidBest", "khabari_18"]  # بدون @ — ربات باید ادمین این کانال‌ها باشد
 
 RSS_FEEDS = [
-    "https://www.donya-e-eqtesad.com/rss",
-    "https://www.eghtesadnews.com/rss",
-    "https://www.reuters.com/business/finance/rss",
+    # اقتصاد
+    "https://www.tasnimnews.com/fa/rss/feed/0/0/78",   # اقتصادی — تسنیم
+    "https://news.google.com/rss/search?q=%D8%A7%D9%82%D8%AA%D8%B5%D8%A7%D8%AF%20%D8%A7%DB%8C%D8%B1%D8%A7%D9%86&hl=fa&gl=IR&ceid=IR:fa",  # اقتصاد ایران — گوگل نیوز
+
+    # جنگ / نظامی / بین‌الملل
+    "https://www.tasnimnews.com/fa/rss/feed/0/0/11",   # نظامی | دفاعی | امنیتی — تسنیم
+    "https://www.tasnimnews.com/fa/rss/feed/0/0/8",    # بین‌الملل — تسنیم
+    "https://www.aljazeera.com/xml/rss/all.xml",       # الجزیره — جنگ و اخبار بین‌المللی
+
+    # تکنولوژی
     "https://www.zoomit.ir/feed/",
     "https://digiato.com/feed",
     "https://techcrunch.com/feed/",
