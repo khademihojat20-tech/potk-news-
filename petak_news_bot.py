@@ -42,23 +42,40 @@ RECENT_TITLES_FILE = DATA_DIR / "recent_titles.json"
 RECENT_TITLES_MAX = 80          # چند عنوان اخیر برای تشخیص تکرار نگه داشته شود
 TITLE_SIMILARITY_THRESHOLD = 0.72   # بالاتر از این حد = خبر تکراری در نظر گرفته می‌شود
 
-MAX_ITEMS_PER_RUN = 5          # تعداد خبر RSS در هر چرخه
-RUN_TIMES = ["08:00", "12:00", "16:00", "20:00"]
+MAX_ITEMS_PER_RUN = 15         # تعداد خبر RSS در هر چرخه (چون منابع بیشتر شدند)
+RUN_TIMES = ["07:00", "09:30", "12:00", "14:30", "17:00", "19:30", "22:00"]  # با تعداد فید بیشتر، چرخه‌ی بیشتر
 BREAKING_CHECK_MINUTES = 20    # بررسی کانال‌های منبع
 
 SOURCE_CHANNEL_USERNAMES = ["RoidBest", "khabari_18"]  # بدون @ — ربات باید ادمین این کانال‌ها باشد
 
 RSS_FEEDS = [
-    # اقتصاد
-    "https://www.tasnimnews.com/fa/rss/feed/0/0/78",   # اقتصادی — تسنیم
-    "https://news.google.com/rss/search?q=%D8%A7%D9%82%D8%AA%D8%B5%D8%A7%D8%AF%20%D8%A7%DB%8C%D8%B1%D8%A7%D9%86&hl=fa&gl=IR&ceid=IR:fa",  # اقتصاد ایران — گوگل نیوز
+    # ===== ۱۵ خبرگزاری معتبر جهانی (رتبه‌بندی بر اساس اعتبار و پوشش جهانی) =====
+    "http://feeds.bbci.co.uk/news/world/rss.xml",                                   # ۱. BBC World
+    "https://www.aljazeera.com/xml/rss/all.xml",                                    # ۲. Al Jazeera
+    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",                       # ۳. The New York Times
+    "https://www.theguardian.com/world/rss",                                        # ۴. The Guardian
+    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",                                  # ۵. Wall Street Journal
+    "http://rss.cnn.com/rss/edition_world.rss",                                     # ۶. CNN World
+    "https://feeds.npr.org/1004/rss.xml",                                           # ۷. NPR World
+    "https://rss.dw.com/rdf/rss-en-all",                                            # ۸. Deutsche Welle
+    "https://www.france24.com/en/rss",                                              # ۹. France 24
+    "https://www.ft.com/rss/home",                                                  # ۱۰. Financial Times
+    "http://feeds.skynews.com/feeds/rss/world.xml",                                 # ۱۱. Sky News World
+    "https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en",     # ۱۲. Reuters
+    "https://news.google.com/rss/search?q=site:apnews.com&hl=en-US&gl=US&ceid=US:en",      # ۱۳. Associated Press
+    "https://news.google.com/rss/search?q=site:bloomberg.com&hl=en-US&gl=US&ceid=US:en",   # ۱۴. Bloomberg
+    "https://news.google.com/rss/search?q=site:economist.com&hl=en-US&gl=US&ceid=US:en",   # ۱۵. The Economist
 
-    # جنگ / نظامی / بین‌الملل
-    "https://www.tasnimnews.com/fa/rss/feed/0/0/11",   # نظامی | دفاعی | امنیتی — تسنیم
-    "https://www.tasnimnews.com/fa/rss/feed/0/0/8",    # بین‌الملل — تسنیم
-    "https://www.aljazeera.com/xml/rss/all.xml",       # الجزیره — جنگ و اخبار بین‌المللی
+    # ===== ۵ خبرگزاری معتبر ایرانی =====
+    "https://www.tasnimnews.com/fa/rss/feed/0/0/8",     # ۱. تسنیم (بین‌الملل)
+    "https://www.isna.ir/rss",                          # ۲. ایسنا
+    "https://www.mehrnews.com/rss",                     # ۳. مهر
+    "https://www.irna.ir/rss",                          # ۴. ایرنا
+    "https://www.farsnews.ir/rss",                      # ۵. فارس
 
-    # تکنولوژی
+    # ===== اقتصاد و تکنولوژی (ادامه‌ی موضوع اصلی کانال) =====
+    "https://www.tasnimnews.com/fa/rss/feed/0/0/78",    # اقتصادی — تسنیم
+    "https://www.tasnimnews.com/fa/rss/feed/0/0/11",    # نظامی | دفاعی | امنیتی — تسنیم
     "https://www.zoomit.ir/feed/",
     "https://digiato.com/feed",
     "https://techcrunch.com/feed/",
