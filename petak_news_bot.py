@@ -134,7 +134,7 @@ def article_id(entry):
 # -----------------------------
 # تماس با Groq
 # -----------------------------
-def call_groq(prompt):
+def call_groq(prompt, max_retries=4):
     if not GROQ_API_KEY:
         log.error("متغیر محیطی GROQ_API_KEY تنظیم نشده است.")
         raise RuntimeError("GROQ_API_KEY_MISSING")
@@ -152,14 +152,30 @@ def call_groq(prompt):
         "temperature": 0.4,
     }
 
-    r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+    for attempt in range(max_retries):
+        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
 
-    if r.status_code != 200:
+        if r.status_code == 200:
+            data = r.json()
+            return data["choices"][0]["message"]["content"].strip()
+
+        if r.status_code == 429:
+            # به سقف Rate Limit خورده‌ایم — کمی صبر کن و دوباره تلاش کن
+            wait_seconds = 2 * (attempt + 1)
+            try:
+                # Groq معمولاً زمان دقیق انتظار را هم در پیام خطا می‌دهد
+                retry_after = r.json()["error"]["message"]
+            except Exception:
+                retry_after = ""
+            log.warning(f"محدودیت نرخ Groq — {wait_seconds} ثانیه صبر و تلاش دوباره ({attempt+1}/{max_retries})")
+            time.sleep(wait_seconds)
+            continue
+
         log.error(f"خطا در Groq: {r.status_code} {r.text}")
         raise RuntimeError("GROQ_ERROR")
 
-    data = r.json()
-    return data["choices"][0]["message"]["content"].strip()
+    log.error("حداکثر تعداد تلاش برای Groq بدون موفقیت به پایان رسید.")
+    raise RuntimeError("GROQ_RATE_LIMIT_EXCEEDED")
 
 # -----------------------------
 # بازنویسی متن (Ultra Fast با کش)
@@ -414,9 +430,10 @@ def run_cycle_rss():
         to_process.append(article)
 
     futures = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         for article in to_process:
             futures[executor.submit(rewrite_article, article)] = article
+            time.sleep(1.5)  # فاصله بین ارسال‌ها تا به سقف Rate Limit گروک نخوریم
 
         for future in as_completed(futures):
             article = futures[future]
@@ -451,8 +468,11 @@ def run_cycle_channels():
         log.info("پیام جدیدی از کانال‌های منبع نیست.")
         return
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(rewrite_text, m["text"], m.get("source", "کانال تلگرام")): m for m in msgs}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {}
+        for m in msgs:
+            futures[executor.submit(rewrite_text, m["text"], m.get("source", "کانال تلگرام"))] = m
+            time.sleep(1.5)  # فاصله بین ارسال‌ها تا به سقف Rate Limit گروک نخوریم
 
         for future in as_completed(futures):
             m = futures[future]
