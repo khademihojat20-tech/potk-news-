@@ -79,6 +79,10 @@ RSS_FEEDS = [
     "https://www.zoomit.ir/feed/",
     "https://digiato.com/feed",
     "https://techcrunch.com/feed/",
+    "https://www.theverge.com/rss/index.xml",       # The Verge
+    "https://www.wired.com/feed/rss",               # Wired
+    "https://feeds.arstechnica.com/arstechnica/index",  # Ars Technica
+    "https://www.engadget.com/rss.xml",             # Engadget
 ]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [پتک‌نیوز] %(message)s")
@@ -200,7 +204,7 @@ def rewrite_text(raw_text, source_label="نامشخص"):
   - هیچ تحلیل شخصی یا نظر اضافه نداشته باشد.
 - هر جمله باید فشرده و پرمعنا باشد؛ چیزی که می‌شود در یک جمله گفت را در دو جمله نگو.
 - هیچ نام کانال، لینک، یوزرنیم یا تبلیغی از متن اصلی را تکرار نکن.
-- در انتها فقط ۲ هشتگ فارسی مرتبط اضافه کن.
+- هیچ هشتگی اضافه نکن.
 - فقط متن نهایی پست خبری را بده، بدون هیچ توضیح اضافه و بدون خط منبع (منبع جداگانه اضافه می‌شود).
 
 متن خبر:
@@ -280,7 +284,8 @@ def extract_video_from_entry(entry):
 # -----------------------------
 def post(text, breaking=False, image_url=None, video_url=None, source_label="نامشخص"):
     prefix = "🚨 <b>خبر فوری</b>\n\n" if breaking else ""
-    full_text = f"{prefix}{text}\n\n🔗 منبع: {source_label}\n\n📡 {CHANNEL_NAME}"
+    channel_tag = f'<a href="https://t.me/{TELEGRAM_CHANNEL_ID.lstrip("@")}">📡 {CHANNEL_NAME} | @{TELEGRAM_CHANNEL_ID.lstrip("@")}</a>'
+    full_text = f"{prefix}{text}\n\n🔗 منبع: {source_label}\n\n{channel_tag}"
     # کپشن تلگرام (برای عکس/ویدیو) حداکثر ۱۰۲۴ کاراکتر است
     caption = full_text[:1024]
 
